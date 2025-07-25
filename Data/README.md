@@ -1,1 +1,1 @@
-Paste the input data here, please use CDO to transform it to monthly data on a 0.5 to 0.5 degree grid.
+Paste the input data here, please use Climate Data Operators (CDO) to transform it to monthly data on a 0.5 to 0.5 degree grid.
