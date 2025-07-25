@@ -1,0 +1,1 @@
+Please paste the independent burned area observations here (national databases).
