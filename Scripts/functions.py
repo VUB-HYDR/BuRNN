@@ -11,6 +11,7 @@ from iris import coord_categorisation
 from iris.time import PartialDateTime
 import torch
 import torch.nn as nn
+from contextlib import contextmanager
 from torchmetrics.functional import spearman_corrcoef, pearson_corrcoef
 import warnings
 from global_variables import *
@@ -42,7 +43,7 @@ def constrain_time(obj, start_year, end_year, start_month=1, end_month=12):
     elif type(obj) in (xr.Dataset, xr.DataArray):
         start_time = np.datetime64(datetime.datetime(start_year, start_month, 1, 0, 0, 0))
         if end_year:
-            end_time = np.datetime64(datetime.datetime(end_year, end_month, 1, 0, 0, 0))
+            end_time = np.datetime64(datetime.datetime(end_year, end_month, 28, 0, 0, 0))
         else:
             end_time = obj.time[-1]
         return obj.sel(time=(obj.time >= start_time) * (obj.time <= end_time))
@@ -82,6 +83,11 @@ def preprocess(ds, variables, start_year=1901, end_year=2020, start_month=1):
     ds = ds.drop_vars(dropvars)
     ds = preprocess_time(ds)
     ds = constrain_time(ds, start_year=start_year, end_year=end_year, start_month=start_month)
+
+    if 'latitude' in ds.coords:
+        ds.rename({'latitude': 'lat'})
+    if 'longitude' in ds.coords:
+        ds.rename({'longitude': 'lon'})
     
     if ds.lat[0] < ds.lat[-1]:
         ds = ds.reindex(lat=list(reversed(ds.lat)))
@@ -92,17 +98,20 @@ def preprocess(ds, variables, start_year=1901, end_year=2020, start_month=1):
 def divide_by_100(x):
     return x/100
 
-def log_transform(arr, epsilon=1e-6):
-    return np.log1p(arr + epsilon) - epsilon
+def log_transform(arr):
+    return np.log1p(arr)
 
-def log_transform_scaled(arr, epsilon_magnitude=6):
-    return (np.log10(arr + 1/10**epsilon_magnitude) + epsilon_magnitude)/epsilon_magnitude
+def log10_transform(arr, epsilon=1e-12):
+    arr = arr.where(arr!=0, epsilon)
+    return np.log10(arr)
 
-def log_inverse(arr, epsilon=1e-6):
-    return np.expm1(arr) - epsilon
+def log_inverse(arr):
+    arr = np.expm1(arr)
+    return arr
 
-def log_inverse_scaled(arr, epsilon_magnitude=6):
-    return 10**(arr * epsilon_magnitude-epsilon_magnitude) - 1/10**epsilon_magnitude
+def log10_inverse(arr, epsilon_magnitude=12):
+    return xr.where(arr == -epsilon_magnitude, 0, 10 ** arr)
+
 
 
 def normalize_features(x):
@@ -175,6 +184,41 @@ def to_mha_cube(cube):
     weights = iris.analysis.cartography.area_weights(new_cube) # pixel size in m^2
     new_cube.units = '1e6 hectare' # Mha
     return new_cube * (weights/10**12)
+
+
+def calculate_edges(centers):
+    if type(centers) not in [list, np.array]:
+        centers = centers.values
+    midpoints = (centers[:-1] + centers[1:]) / 2
+    # first edge
+    first_edge = centers[0] - (midpoints[0] - centers[0])
+    # last edge
+    last_edge = centers[-1] + (centers[-1] - midpoints[-1])
+    # combine
+    edges = np.concatenate([[first_edge], midpoints, [last_edge]])
+    return edges
+
+def calculate_area_weights(lat, lon):
+    lat_edges = calculate_edges(lat)  # len(lat)+1
+    lon_edges = calculate_edges(lon)  # len(lon)+1
+
+    lat_edges_rad = np.deg2rad(lat_edges)
+    lon_edges_rad = np.deg2rad(lon_edges)
+
+    R = 6371000  # meters
+    dlat_sin = np.abs(np.sin(lat_edges_rad[1:]) - np.sin(lat_edges_rad[:-1]))  # len(lat)
+    dlon = np.abs(lon_edges_rad[1:] - lon_edges_rad[:-1])  # len(lon)
+
+    # Use meshgrid to get 2D array exactly matching (lat, lon)
+    dlat2d, dlon2d = np.meshgrid(dlat_sin, dlon, indexing="ij")
+    area_vals = R**2 * dlat2d * dlon2d  # shape (lat, lon)
+
+    area = xr.DataArray(area_vals, dims=("lat", "lon"), coords={"lat": lat, "lon": lon})
+    return area
+
+def to_mha_xarray(ds):
+    area = calculate_area_weights(ds.lat, ds.lon)
+    return ds*area/10**12
 
 def to_mha(obj):
     if type(obj) == iris.cube.Cube:
@@ -254,6 +298,43 @@ def weighted_mean(da):
     weights = 6371229**2*((lon1-lon2)*(np.sin(lat1) - np.sin(lat2)))
     return da.weighted(weights).mean(dim=['stacked_lat_lon'])#/weights.sum()
 
+
+@contextmanager
+def captum_safe_mode(model):
+    """
+    Context manager for running Captum on cuDNN LSTMs safely.
+    
+    - Sets model to train() so cuDNN allows backward through LSTM.
+    - Turns OFF all dropout layers so forward pass stays deterministic.
+    - Restores original training/eval mode afterwards.
+    """
+    
+    # Save original mode of the model
+    was_training = model.training
+    
+    # We need training mode for cuDNN backward
+    model.train()
+    
+    # Store dropout modules to restore them later
+    dropout_modules = []
+    for m in model.modules():
+        if isinstance(m, nn.Dropout):
+            dropout_modules.append(m)
+    
+    # Turn OFF (eval) all dropout layers
+    # This keeps the forward deterministic
+    for m in dropout_modules:
+        m.eval()
+    
+    try:
+        yield  # run the Captum call
+    finally:
+        # Restore original model mode
+        if was_training:
+            model.train()
+        else:
+            model.eval()
+
 def f1_recall_precision(outputs, targets):
     true_pos = torch.count_nonzero((outputs>0)[targets>0])
     true_neg = torch.count_nonzero((outputs<=0)[targets<=0])
@@ -278,7 +359,7 @@ def f1_recall_precision(outputs, targets):
         f1 = (2*true_pos)/(2*true_pos + false_pos + false_neg)
         f1 = f1
     return f1, recall, precision
-    
+
 
 def nse(outputs, targets, epsilon=1e-1):
     # Add small error to variance, 0.1?
@@ -301,24 +382,21 @@ def kge(outputs, targets, epsilon=1e-2):
     return kge, alpha, beta, r
 
 
-def Binary_and_MSELoss(outputs, targets, bce_loss_fn, alpha=0.5, lambda_factor=1):
+def Binary_and_MSELoss(outputs, targets, bce_loss_fn, alpha=0.5, lambda_factor=1, zero=0):
     binary_output = outputs[:, :, 0].unsqueeze(-1)
     regression_output = outputs[:, :, 1].unsqueeze(-1)
         
     # Create binary target
-    binary_target = targets > 0
+    binary_target = targets > zero
     
     # Calculate binary loss
     classification_loss = bce_loss_fn(binary_output, binary_target.float())  
 
     # Calculate regression loss for positive samples  
-    mask = targets > 0  
-    if mask.any():  # Avoid division by zero
-        regression_loss = nn.MSELoss(reduction='sum')(regression_output[mask], targets[mask])
+    if binary_target.any():  # Avoid division by zero
+        regression_loss = nn.MSELoss(reduction='mean')(regression_output[binary_target], targets[binary_target])
     else:
         regression_loss = torch.tensor(0.0)  # No non-zero targets in this batch
-    #regression_output = (binary_classification_target>0).float() * regression_output
-    #regression_loss = nn.MSELoss(reduction='mean')(regression_output, targets)   
     
     # Combine the losses
     total_loss = alpha*classification_loss + (1-alpha) * lambda_factor * regression_loss
@@ -330,6 +408,44 @@ def Binary_and_MSELoss(outputs, targets, bce_loss_fn, alpha=0.5, lambda_factor=1
     
     log_params['NSE'] = nse(regression_output, targets)
     #log_params['KGE'], log_params['KGE_alpha'], log_params['KGE_beta'], log_params['KGE_r'] = kge(regression_output, targets)
+    log_params['F1-score'], log_params['recall'], log_params['precision'] = f1_recall_precision(binary_output, targets)
+
+    log_params = {key: value.detach() if isinstance(value, torch.Tensor) else value for key, value in log_params.items()}
+    
+    return total_loss, log_params
+
+
+def Binary_and_NLLLoss(outputs, targets, bce_loss_fn, alpha=0.5, lambda_factor=1, zero=0):
+    binary_output = outputs[:, :, 0].unsqueeze(-1)
+    mu = outputs[:, :, 1].unsqueeze(-1)
+    log_var = outputs[:, :, 2].unsqueeze(-1)
+        
+    # Create binary target
+    binary_target = targets > zero
+    
+    # Calculate binary loss
+    classification_loss = bce_loss_fn(binary_output, binary_target.float())  
+
+    # Calculate regression loss for positive samples  
+    if binary_target.any():  # Avoid division by zero
+        y_true = targets[binary_target]
+        mu_pos = mu[binary_target]
+        log_var_pos = log_var[binary_target]
+
+        var_pos = torch.exp(log_var_pos)
+        nll = 0.5 * ((y_true - mu_pos) ** 2 / var_pos + log_var_pos + math.log(2 * math.pi))
+        regression_loss = nll.mean()
+    else:
+        regression_loss = torch.tensor(0.0)  # No non-zero targets in this batch
+    
+    # Combine the losses
+    total_loss = alpha*classification_loss + (1-alpha) * lambda_factor * regression_loss
+    
+    log_params = {
+        'loss': total_loss.detach(),
+        'classification_loss': classification_loss.detach(),
+        'regression_loss': (lambda_factor * regression_loss).detach()}
+    
     log_params['F1-score'], log_params['recall'], log_params['precision'] = f1_recall_precision(binary_output, targets)
 
     log_params = {key: value.detach() if isinstance(value, torch.Tensor) else value for key, value in log_params.items()}
@@ -387,21 +503,29 @@ def MSE_and_VarLoss(outputs, targets, lambda_factor=1):
 
     return total_loss, log_params 
 
-def CustomLoss(outputs, targets, metric_name, lambda_factor=1):
-    outputs = outputs[:, :, 1].unsqueeze(-1)
-    log_params = {}
-    log_params['NSE'] = nse(outputs, targets)
-    #log_params['KGE'], log_params['KGE_alpha'], log_params['KGE_beta'], log_params['KGE_r'] = kge(outputs, targets)
-    log_params['F1-score'], log_params['recall'], log_params['precision'] = f1_recall_precision(outputs, targets)
+def Gaussian_NLLLoss(outputs, targets):
+    # unpack model outputs
+    mu = outputs[:, :, 0].unsqueeze(-1)       # mean in z-space
+    log_var = outputs[:, :, 1].unsqueeze(-1)  # log variance in z-space
+    
+    # convert log variance to variance
+    var = torch.exp(log_var)
 
-    log_params['loss'] = log_params[metric_name]
-    loss = log_params[metric_name].clone()
-    log_params = {key: value.detach() if isinstance(value, torch.Tensor) else value for key, value in log_params.items()}
+    # Gaussian negative log likelihood
+    nll = 0.5 * ((targets - mu) ** 2 / var + log_var + math.log(2 * math.pi))
+    loss = nll.mean()
+
+    # log metrics
+    log_params = {
+        'loss': loss.detach(),
+        'nll': loss.detach(),
+    }
+
     return loss, log_params
 
 INVERSE_FUNCS = {divide_by_100: lambda x: x.multiply(100),
                     log_transform: log_inverse,
-                    log_transform_scaled: log_inverse_scaled
+                    log10_transform: log10_inverse
                          }
 
 

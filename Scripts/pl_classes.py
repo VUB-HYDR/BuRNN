@@ -43,6 +43,26 @@ class DummyLayer(nn.Module):
 
     def forward(self, x):
         return x
+    
+class MultiHeadOutput(nn.Module):
+    def __init__(self, hidden_size, n_targets):
+        super().__init__()
+        self.n_targets = n_targets
+        self.class_head = nn.Linear(hidden_size, 1)
+        self.mu_head = nn.Linear(hidden_size, 1)
+        if n_targets == 3:
+            self.logvar_head = nn.Linear(hidden_size, 1)
+            nn.init.constant_(self.logvar_head.bias, -2.0)
+
+    def forward(self, x):
+        # x: (batch, seq_len, hidden_size)
+        binary_out = self.class_head(x)
+        mu = self.mu_head(x)
+        output = torch.cat([binary_out, mu], dim=-1)
+        if self.n_targets == 3:
+            log_var = self.logvar_head(x)
+            output = torch.cat([output, log_var], dim=-1)
+        return output
 
 class ReconstructionDataset(HyperparametersMixin, Dataset):
     def __init__(self, data_arr, features, targets, spinup_length=24, prediction_length=0, prediction_start_idx=0):
@@ -88,6 +108,12 @@ class ReconstructionDataset(HyperparametersMixin, Dataset):
     def unnormalize(self, mean, std):
         self.x = (self.x*std)+mean
 
+    def normalize_targets(self, mean, std):
+        self.y = (self.y-mean)/std
+
+    def unnormalize_targets(self, mean, std):
+        self.y = (self.y*std)+mean
+
 
 class MultipleDataset(Dataset):
     def __init__(self, datasets):
@@ -121,6 +147,15 @@ class MultipleDataset(Dataset):
         for ds in self.datasets:
             ds.unnormalize(mean, std)
 
+    def normalize_targets(self, mean, std):
+        for ds in self.datasets:
+            ds.normalize_targets(mean, std)
+
+    def unnormalize_targets(self, mean, std):
+        for ds in self.datasets:
+            ds.unnormalize_targets(mean, std)
+
+
     def _compute_weights(self):
         weights = []
         for dataset in self.datasets:
@@ -153,6 +188,7 @@ class LightningLSTM(pl.LightningModule):
                  spinup_length=24, 
                  ba_as_predictor=False, 
                  teacher_forcing_ratio=0.95,
+                 seperate_heads=False,
                  seed=SEED):
         ## input_size = number of features (or variables) in the data. 
         ## hidden_size = this determines the dimension of the output
@@ -187,8 +223,11 @@ class LightningLSTM(pl.LightningModule):
         if self.hparams.linear:
             self.lstm = nn.LSTM(input_size=self.hparams.input_size+self.hparams.ba_as_predictor, hidden_size=self.hparams.hidden_size, num_layers=self.hparams.num_layers, batch_first=True, dropout=self.hparams.dropout) 
             self.batchnorm = TransposeBatchNorm(self.hparams.hidden_size)
-            self.fc = nn.Linear(self.hparams.hidden_size, self.hparams.output_size)
             self.dropout = nn.Dropout(p=self.hparams.dropout)
+            if self.hparams.seperate_heads:
+                self.fc = MultiHeadOutput(self.hparams.hidden_size, self.hparams.output_size)
+            else:
+                self.fc = nn.Linear(self.hparams.hidden_size, self.hparams.output_size)
             self.model_sequence = nn.Sequential(
                 self.batchnorm,
                 self.lstm_activ_f,
@@ -340,6 +379,7 @@ class ReconstructionDataModuleFolds(pl.LightningDataModule):
                  val_folds: list[list[str]] = [],
                  test_folds: list[list[str]] = [],
                  init_normalize = True,
+                 init_normalize_targets = False,
                  weighted_sampling = False,
                  pred = False,
                  dataloader_kwargs = {},
@@ -349,8 +389,12 @@ class ReconstructionDataModuleFolds(pl.LightningDataModule):
         self.save_hyperparameters()
         self.train_x_mean = 0
         self.train_x_std = 1
+        self.train_y_mean = 0
+        self.train_y_std = 1
         self.val_folds_idx = []
         self.test_folds_idx = []
+        self.val_folds = []
+        self.test_folds = []
         if not features:
             raise KeyError('No features given, must specify at least one feature!')
         if not targets:
@@ -378,7 +422,7 @@ class ReconstructionDataModuleFolds(pl.LightningDataModule):
 
         self.split_folds(val_folds=val_folds, test_folds=test_folds)
         self.preprocess_data()       
-        self.generate_datasets(normalize=init_normalize)
+        self.generate_datasets(normalize=init_normalize, normalize_targets=init_normalize_targets)
 
         
     def create_dataset(self, exclusion_list):
@@ -394,7 +438,6 @@ class ReconstructionDataModuleFolds(pl.LightningDataModule):
                 stitching_years = 1901-start_year_spinup
                 # Stitch the first X months to the front so the spinup won't disregard them.
                 first_n = self.ds.isel(time=slice(0, self.hparams.spinup_length))
-                print(first_n['time'])
                 first_n['time'] = first_n['time'].values.astype('datetime64[M]') - stitching_years*12
                 self.ds = xr.concat([first_n, self.ds], dim='time', join='exact')
             self.train_start_idx = int(np.where(self.ds.time.dt.year == 1997)[0][0])
@@ -456,6 +499,7 @@ class ReconstructionDataModuleFolds(pl.LightningDataModule):
             n = x.shape[0] * x.shape[1]  # Number of samples in the current tensor
             mean = x.mean(dim=(0, 1))  # Mean over 'sample' and 'time' for each variable
             variance = x.var(dim=(0, 1), unbiased=False)  # Variance over 'sample' and 'time'
+            #max = x.max(dim=(0, 1)) # Max over 'sample' and 'time'
 
             if mean_acc is None:
                 # Initialize accumulators with the first DataArray
@@ -471,7 +515,10 @@ class ReconstructionDataModuleFolds(pl.LightningDataModule):
 
         # Finalize mean and standard deviation
         self.train_x_mean = mean_acc
+        #self.train_x_mean[self.hparams.static_features] = 0
         self.train_x_std = torch.sqrt(m2_acc / n_total)
+        self.train_x_std = torch.max(self.train_x_std, torch.full_like(self.train_x_std, 1e-3)) # Floor stddev to 1e-3 for low variance features
+        #self.train_x_std[self.hparams.static_features] = max[self.hparams.static_features]
 
         for ds in self.fold_datasets:
             ds.normalize(mean=self.train_x_mean, std=self.train_x_std)
@@ -480,8 +527,52 @@ class ReconstructionDataModuleFolds(pl.LightningDataModule):
     def unnormalize_features(self):
         for ds in self.fold_datasets:
             ds.unnormalize(mean=self.train_x_mean, std=self.train_x_std)
+        self.train_x_mean = 0
+        self.train_x_std = 1
         return None
     
+    def normalize_targets(self):
+        # Initialize accumulators
+        n_total = 0
+        mean_acc = None
+        m2_acc = None  # Accumulator for the sum of squares of differences from the mean
+
+        for obj in [ds for idx, ds in enumerate(self.fold_datasets) if idx not in self.test_folds_idx]:
+            y = obj.y
+            if self.hparams.pred:
+                y = y[:, self.train_start_idx:self.train_stop_idx]
+            else:
+                y = y[:, self.hparams.spinup_length:]
+            n = y.shape[0] * y.shape[1]  # Number of samples in the current tensor
+            mean = y.nanmean(dim=(0, 1))  # Mean over 'sample' and 'time' for each variable
+            variance = y.var(dim=(0, 1), unbiased=False)  # Variance over 'sample' and 'time'
+
+            if mean_acc is None:
+                # Initialize accumulators with the first DataArray
+                mean_acc = mean
+                m2_acc = variance * n
+                n_total = n
+            else:
+                # Update accumulators incrementally
+                delta = mean - mean_acc
+                n_total += n
+                mean_acc = mean_acc + delta * (n / n_total)
+                m2_acc = m2_acc + variance * n + (delta**2) * (n_total - n) * n / n_total
+
+        # Finalize mean and standard deviation
+        self.train_y_mean = mean_acc
+        self.train_y_std = torch.sqrt(m2_acc / n_total)
+
+        for ds in self.fold_datasets:
+            ds.normalize_targets(mean=self.train_y_mean, std=self.train_y_std)
+        return None
+    
+    def unnormalize_targets(self):
+        for ds in self.fold_datasets:
+            ds.unnormalize_targets(mean=self.train_y_mean, std=self.train_y_std)
+        self.train_y_mean = 0
+        self.train_y_std = 1
+        return None
 
     def preprocess_data(self):
         self.ds_stacked = self.ds.stack(sample=['lat', 'lon'])
@@ -504,10 +595,10 @@ class ReconstructionDataModuleFolds(pl.LightningDataModule):
         self.ds_transformed = xr.concat([self.x, self.y], dim='variable')
         #self.ds_transformed = self.ds_transformed.load()
         
-    def generate_datasets(self, normalize=True):
+    def generate_datasets(self, normalize=True, normalize_targets=True):
         self.fold_datasets = [self.ds_transformed.sel(sample=fold_coords) for fold_coords in self.folds_coords]
         self.fold_datasets = [ReconstructionDataset(dataset, features=self.hparams.features, targets=self.hparams.targets, spinup_length=self.hparams.spinup_length, prediction_length=self.hparams.prediction_length) for dataset in self.fold_datasets]
-        self.change_val_test_folds(val_folds=self.hparams.val_folds, test_folds=self.hparams.test_folds, normalize=normalize)
+        self.change_val_test_folds(val_folds=self.hparams.val_folds, test_folds=self.hparams.test_folds, normalize=normalize, normalize_targets=normalize_targets)
 
 
     def generate_dataloaders(self):
@@ -537,6 +628,9 @@ class ReconstructionDataModuleFolds(pl.LightningDataModule):
         #elif mode.lower() == 'pred' or mode.lower() == 'predict':
             #return self.pred_loader
         raise ValueError('Wrong value for mode')
+    
+    def get_target_zero(self):
+        return ((torch.Tensor([0])-self.train_y_mean) / self.train_y_std).item()
 
 
     def reconstruct_pedictions(self, predictions, mode):
@@ -565,12 +659,18 @@ class ReconstructionDataModuleFolds(pl.LightningDataModule):
         self.generate_dataloaders()
 
 
-    def change_val_test_folds(self, val_folds=None, test_folds=None, normalize=True, pred_length=0):
+    def change_val_test_folds(self, val_folds=None, test_folds=None, normalize=True, normalize_targets=True, pred_length=0):
         self.split_folds(val_folds=val_folds, test_folds=test_folds, pred_length=pred_length)
         if normalize:
             if isinstance(self.train_x_mean, torch.Tensor):
                 self.unnormalize_features()
             self.normalize_features()
+        if normalize_targets:
+            if isinstance(self.train_y_mean, torch.Tensor):
+                self.unnormalize_targets()
+                print('unnormalized')
+            self.normalize_targets() 
+            print('normalized')
         self.generate_dataloaders()
   
     def split_folds(self, val_folds=None, test_folds=None, pred_length=0):
@@ -589,6 +689,7 @@ class ReconstructionDataModuleFolds(pl.LightningDataModule):
             self.hparams.val_folds = val_folds
             self.val_coords = [fold_coord for idx, fold_coord in enumerate(self.folds_coords) if idx in self.val_folds_idx]
             self.val_coords = [coord for coords in self.val_coords for coord in coords]
+            self.val_folds = val_folds
 
         if test_folds:
             self.test_folds_idx = []
@@ -606,7 +707,46 @@ class ReconstructionDataModuleFolds(pl.LightningDataModule):
             self.hparams.test_folds = test_folds
             self.test_coords = [fold_coord for idx, fold_coord in enumerate(self.folds_coords) if idx in self.test_folds_idx]
             self.test_coords = [coord for coords in self.test_coords for coord in coords]
+            self.test_folds = test_folds
         
         self.train_coords = [fold_coord for idx, fold_coord in enumerate(self.folds_coords) if idx not in self.val_folds_idx + self.test_folds_idx]
         self.train_coords = [coord for coords in self.train_coords for coord in coords]
+
+
+
+class NLLPredWrapper(nn.Module):
+    def __init__(self, base_model, train_y_mean, train_y_std, use_last_timestep=True):
+        super().__init__()
+        self.base_model = base_model
+        # store as parameters/buffers so they move with .to(device)
+        self.register_buffer("train_y_mean", torch.as_tensor(train_y_mean))
+        self.register_buffer("train_y_std", torch.as_tensor(train_y_std))
+        self.use_last_timestep = use_last_timestep
+
+    def forward(self, x):
+        """
+        x: (batch, seq_in, features)
+        returns: (batch,) final decoded prediction in real space
+        """
+        preds = self.base_model(x)          # (batch, T, 3)
+
+        if self.use_last_timestep:
+            preds = preds[:, -1, :]         # (batch, 3)
+
+        pred_class = preds[..., 0:1]        # (batch, 1)
+        pred_reg   = preds[..., 1:2]        # normalized log-mean
+        pred_logvar = preds[..., 2:3]       # normalized log-var
+
+        # denormalize μ_log and σ_log^2
+        mu_log = pred_reg * self.train_y_std + self.train_y_mean
+        var_log = torch.exp(pred_logvar) * (self.train_y_std ** 2)
+
+        # lognormal expectation: E[y] = exp(μ + 0.5 σ^2)
+        logmean_real = mu_log + 0.5 * var_log
+        y_hat = torch.exp(logmean_real)     # (batch, 1)
+
+        y_hat_masked = ((pred_class>0).float() * y_hat).squeeze(-1)     # (batch)
+        max_tensor = torch.full_like(y_hat_masked, 100)
+
+        return torch.min(max_tensor, y_hat_masked)         # (batch,)
             
